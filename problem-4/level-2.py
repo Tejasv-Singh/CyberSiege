@@ -1,753 +1,774 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-SSH Brute Force IP Blocking System
+Universal SSH Brute Force Defender (Level 2)
+A cross-platform solution for detecting and preventing SSH brute force attacks.
 
-This module provides classes and functions to implement an adaptive IP blocking system
-for SSH brute force defense, with cross-platform support.
+Features:
+- Real-time alert system (Slack, Email)
+- Adaptive blocking with cooldown periods
+- Distributed attack detection
+- Cross-platform support (Linux, macOS, Windows)
 """
 
 import os
 import sys
-import json
-import yaml
-import logging
-import ipaddress
-import subprocess
-import threading
 import time
-from datetime import datetime, timedelta
+import json
+import logging
+import socket
+import sqlite3
+import smtplib
+import requests
+import platform
+import ipaddress
+import datetime
+import threading
+import configparser
+from typing import Dict, List, Set, Union, Optional, Tuple, Any
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from pathlib import Path
+from dataclasses import dataclass
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor
+
+# Third-party imports
+import yaml
+import geoip2.database
+from geoip2.errors import AddressNotFoundError
+
+# Platform-specific imports
+PLATFORM = platform.system().lower()
+if PLATFORM == "linux":
+    import iptc  # python-iptables
+elif PLATFORM == "darwin":  # macOS
+    import subprocess
+elif PLATFORM == "windows":
+    import win32com.client
+    import win32security
+    import ntsecuritycon
+
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("/var/log/ssh_defender_blocks.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
-logger = logging.getLogger('ssh_blocker')
+logger = logging.getLogger("ssh_defender")
 
-# Ensure log directory exists
-BLOCK_LOG_PATH = '/var/log/ssh_defender_blocks.log'
-os.makedirs(os.path.dirname(BLOCK_LOG_PATH), exist_ok=True)
 
-# Configure file handler for block log
-block_file_handler = logging.FileHandler(BLOCK_LOG_PATH)
-block_file_handler.setLevel(logging.INFO)
-block_formatter = logging.Formatter('%(asctime)s - %(message)s')
-block_file_handler.setFormatter(block_formatter)
-
-block_logger = logging.getLogger('ssh_block_logger')
-block_logger.addHandler(block_file_handler)
-block_logger.setLevel(logging.INFO)
-block_logger.propagate = False  # Don't propagate to parent loggers
-
-# Block storage paths
-BLOCK_STORAGE_DIR = '/var/lib/ssh_defender'
-os.makedirs(BLOCK_STORAGE_DIR, exist_ok=True)
-BLOCK_STORAGE_PATH = os.path.join(BLOCK_STORAGE_DIR, 'active_blocks.json')
-
-class IPBlocker(ABC):
-    """Abstract base class for platform-specific IP blocking implementations."""
+@dataclass
+class LoginAttempt:
+    """Data structure for storing login attempt information."""
+    ip: str
+    username: str
+    timestamp: float
+    password: Optional[str] = None
+    geo_data: Optional[Dict[str, Any]] = None
     
-    @abstractmethod
-    def block_ip(self, ip_address, duration_hours=24):
-        """
-        Block an IP address for the specified duration.
-        
-        Args:
-            ip_address (str): The IP address to block
-            duration_hours (int): Number of hours to block the IP for
-            
-        Returns:
-            bool: True if block was successful, False otherwise
-        """
-        pass
-        
-    @abstractmethod
-    def unblock_ip(self, ip_address):
-        """
-        Remove a block on an IP address.
-        
-        Args:
-            ip_address (str): The IP address to unblock
-            
-        Returns:
-            bool: True if unblock was successful, False otherwise
-        """
-        pass
-        
-    @abstractmethod
-    def is_blocked(self, ip_address):
-        """
-        Check if an IP address is currently blocked.
-        
-        Args:
-            ip_address (str): The IP address to check
-            
-        Returns:
-            bool: True if IP is blocked, False otherwise
-        """
-        pass
-        
-    @abstractmethod
-    def reload_blocks(self, active_blocks):
-        """
-        Reload active blocks from saved state (e.g., after reboot).
-        
-        Args:
-            active_blocks (dict): Dictionary of IP addresses and their expiration times
-            
-        Returns:
-            bool: True if reload was successful, False otherwise
-        """
-        pass
 
-
-class LinuxIPBlocker(IPBlocker):
-    """Linux implementation of IP blocking using iptables."""
+class ConfigManager:
+    """Manages configuration loading and access for different platforms."""
     
     def __init__(self):
-        """Initialize the Linux IP blocker."""
+        """Initialize the configuration manager and load platform-specific config."""
+        self.config = {}
+        self.platform = PLATFORM
+        self.config_path = self._get_config_path()
+        self.load_config()
+        self.whitelist = self._load_whitelist()
+        
+    def _get_config_path(self) -> str:
+        """Get the platform-specific configuration file path."""
+        if self.platform == "linux":
+            return "/etc/ssh-defender.yaml"
+        elif self.platform == "darwin":  # macOS
+            return os.path.expanduser("~/Library/ssh-defender.conf")
+        elif self.platform == "windows":
+            return r"C:\ssh-defender\config.ini"
+        else:
+            raise OSError(f"Unsupported platform: {self.platform}")
+    
+    def load_config(self) -> None:
+        """Load configuration from the appropriate file based on platform."""
         try:
-            import iptc
-            self.iptc = iptc
-            self.chain_name = "SSH_DEFENDER"
-            self._ensure_chain_exists()
-            logger.info("Linux IPBlocker initialized with python-iptables")
-        except ImportError:
-            logger.error("python-iptables not installed. Please install with: pip install python-iptables")
+            if self.platform in ["linux", "darwin"]:
+                with open(self.config_path, 'r') as f:
+                    self.config = yaml.safe_load(f)
+            elif self.platform == "windows":
+                config = configparser.ConfigParser()
+                config.read(self.config_path)
+                # Convert ConfigParser to dict
+                self.config = {s: dict(config.items(s)) for s in config.sections()}
+            logger.info(f"Configuration loaded from {self.config_path}")
+        except Exception as e:
+            logger.error(f"Failed to load configuration: {e}")
             sys.exit(1)
     
-    def _ensure_chain_exists(self):
-        """Ensure the SSH_DEFENDER chain exists and is hooked up to INPUT."""
-        # Create chain if it doesn't exist
-        table = self.iptc.Table(self.iptc.Table.FILTER)
-        try:
-            chain = self.iptc.Chain(table, self.chain_name)
-        except self.iptc.IPTCError:
-            # Chain doesn't exist, create it
-            table.create_chain(self.chain_name)
-            logger.info(f"Created iptables chain {self.chain_name}")
+    def _load_whitelist(self) -> Set[str]:
+        """Load whitelisted IPs from the configuration."""
+        whitelist = set()
         
-        # Check if jump rule exists in INPUT chain
-        input_chain = self.iptc.Chain(table, "INPUT")
-        jump_exists = False
+        # Extract whitelist from config
+        if self.platform in ["linux", "darwin"]:
+            whitelist_data = self.config.get("whitelist", [])
+        else:  # Windows
+            whitelist_section = self.config.get("Whitelist", {})
+            whitelist_data = whitelist_section.get("ips", "").split(",")
         
-        for rule in input_chain.rules:
-            if rule.target and rule.target.name == self.chain_name:
-                jump_exists = True
-                break
+        # Process and validate IPs
+        for ip in whitelist_data:
+            ip = ip.strip()
+            if ip:
+                try:
+                    # Validate IP
+                    ipaddress.ip_address(ip)
+                    whitelist.add(ip)
+                except ValueError:
+                    logger.warning(f"Invalid IP in whitelist: {ip}")
         
-        # Add jump rule if it doesn't exist
-        if not jump_exists:
-            rule = self.iptc.Rule()
-            rule.protocol = "tcp"
-            match = rule.create_match("tcp")
-            match.dport = "22"
-            rule.target = rule.create_target(self.chain_name)
-            input_chain.insert_rule(rule)
-            logger.info(f"Added jump rule from INPUT to {self.chain_name}")
+        logger.info(f"Loaded {len(whitelist)} whitelisted IPs")
+        return whitelist
     
-    def block_ip(self, ip_address, duration_hours=24):
-        """Block an IP address using iptables."""
-        try:
-            table = self.iptc.Table(self.iptc.Table.FILTER)
-            chain = self.iptc.Chain(table, self.chain_name)
-            
-            # Check if IP is already blocked
-            if self.is_blocked(ip_address):
-                logger.info(f"IP {ip_address} is already blocked")
-                return True
-            
-            # Create rule to block the IP
-            rule = self.iptc.Rule()
-            rule.src = ip_address
-            rule.protocol = "tcp"
-            match = rule.create_match("tcp")
-            match.dport = "22"
-            rule.target = rule.create_target("DROP")
-            
-            # Insert the rule
-            chain.insert_rule(rule)
-            
-            expiry_time = datetime.now() + timedelta(hours=duration_hours)
-            block_logger.info(f"BLOCKED: {ip_address} until {expiry_time.isoformat()}")
-            logger.info(f"Successfully blocked IP {ip_address} for {duration_hours} hours")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to block IP {ip_address}: {str(e)}")
-            return False
+    def get(self, section: str, key: str, default: Any = None) -> Any:
+        """Get a configuration value."""
+        if self.platform in ["linux", "darwin"]:
+            return self.config.get(section, {}).get(key, default)
+        else:  # Windows
+            return self.config.get(section, {}).get(key, default)
     
-    def unblock_ip(self, ip_address):
-        """Remove a block for an IP address from iptables."""
-        try:
-            table = self.iptc.Table(self.iptc.Table.FILTER)
-            chain = self.iptc.Chain(table, self.chain_name)
-            
-            # Find and delete the rule for this IP
-            for rule in chain.rules:
-                if rule.src == ip_address:
-                    chain.delete_rule(rule)
-                    block_logger.info(f"UNBLOCKED: {ip_address}")
-                    logger.info(f"Successfully unblocked IP {ip_address}")
-                    return True
-            
-            logger.info(f"IP {ip_address} was not found in block list")
-            return False
-            
-        except Exception as e:
-            logger.error(f"Failed to unblock IP {ip_address}: {str(e)}")
-            return False
-    
-    def is_blocked(self, ip_address):
-        """Check if an IP address is currently blocked in iptables."""
-        try:
-            table = self.iptc.Table(self.iptc.Table.FILTER)
-            chain = self.iptc.Chain(table, self.chain_name)
-            
-            for rule in chain.rules:
-                if rule.src == ip_address:
-                    return True
-            return False
-            
-        except Exception as e:
-            logger.error(f"Failed to check block status for IP {ip_address}: {str(e)}")
-            return False
-    
-    def reload_blocks(self, active_blocks):
-        """Reload active blocks from saved state."""
-        try:
-            table = self.iptc.Table(self.iptc.Table.FILTER)
-            chain = self.iptc.Chain(table, self.chain_name)
-            
-            # Clear existing rules
-            chain.flush()
-            
-            # Reload active blocks
-            count = 0
-            for ip, expiry_time in active_blocks.items():
-                # Only reload if the block hasn't expired
-                if datetime.fromisoformat(expiry_time) > datetime.now():
-                    rule = self.iptc.Rule()
-                    rule.src = ip
-                    rule.protocol = "tcp"
-                    match = rule.create_match("tcp")
-                    match.dport = "22"
-                    rule.target = rule.create_target("DROP")
-                    chain.insert_rule(rule)
-                    count += 1
-            
-            logger.info(f"Reloaded {count} active IP blocks")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to reload IP blocks: {str(e)}")
-            return False
+    def is_whitelisted(self, ip: str) -> bool:
+        """Check if an IP is whitelisted."""
+        return ip in self.whitelist
 
 
-class WindowsIPBlocker(IPBlocker):
-    """Windows implementation of IP blocking using Windows Firewall."""
+class AlertManager:
+    """Manages real-time alerts via Slack and email."""
     
-    def __init__(self):
-        """Initialize the Windows IP blocker."""
-        self.rule_name_prefix = "SSH_Defender_Block_"
-        logger.info("Windows IPBlocker initialized")
-    
-    def block_ip(self, ip_address, duration_hours=24):
-        """Block an IP address using Windows Firewall."""
+    def __init__(self, config_manager: ConfigManager):
+        """Initialize the alert manager."""
+        self.config = config_manager
+        
+        # Slack configuration
+        slack_config = self.config.get("slack", {}) if PLATFORM in ["linux", "darwin"] else self.config.get("Slack", {})
+        self.slack_webhook = slack_config.get("webhook_url", "")
+        self.slack_enabled = bool(self.slack_webhook)
+        
+        # Email configuration
+        email_config = self.config.get("email", {}) if PLATFORM in ["linux", "darwin"] else self.config.get("Email", {})
+        self.email_enabled = email_config.get("enabled", False)
+        self.email_from = email_config.get("from", "")
+        self.email_to = email_config.get("to", "")
+        self.email_smtp_host = email_config.get("smtp_host", "")
+        self.email_smtp_port = int(email_config.get("smtp_port", 587))
+        self.email_username = email_config.get("username", "")
+        self.email_password = email_config.get("password", "")
+        self.email_use_tls = email_config.get("use_tls", True)
+        
+        # GeoIP database
+        geoip_path = self.config.get("geoip", {}).get("database_path", "/usr/share/GeoIP/GeoLite2-City.mmdb")
         try:
-            # Check if already blocked
-            if self.is_blocked(ip_address):
-                logger.info(f"IP {ip_address} is already blocked")
-                return True
-            
-            # Create a unique rule name
-            rule_name = f"{self.rule_name_prefix}{ip_address.replace('.', '_')}"
-            
-            # Create firewall rule using netsh
-            cmd = [
-                'netsh', 'advfirewall', 'firewall', 'add', 'rule',
-                f'name="{rule_name}"',
-                'dir=in',
-                'action=block',
-                f'remoteip={ip_address}',
-                'protocol=TCP',
-                'localport=22',
-                'enable=yes'
-            ]
-            
-            subprocess.run(cmd, check=True, capture_output=True, text=True)
-            
-            expiry_time = datetime.now() + timedelta(hours=duration_hours)
-            block_logger.info(f"BLOCKED: {ip_address} until {expiry_time.isoformat()}")
-            logger.info(f"Successfully blocked IP {ip_address} for {duration_hours} hours")
-            return True
-            
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to block IP {ip_address}: {e.stderr}")
-            return False
+            self.geoip_reader = geoip2.database.Reader(geoip_path)
+            logger.info("GeoIP database loaded successfully")
         except Exception as e:
-            logger.error(f"Failed to block IP {ip_address}: {str(e)}")
-            return False
+            logger.error(f"Failed to load GeoIP database: {e}")
+            self.geoip_reader = None
     
-    def unblock_ip(self, ip_address):
-        """Remove a block for an IP address from Windows Firewall."""
+    def get_geo_data(self, ip: str) -> Dict[str, Any]:
+        """Get geolocation data for an IP address."""
+        if self.geoip_reader is None:
+            return {"error": "GeoIP database not available"}
+        
         try:
-            # Create the rule name to delete
-            rule_name = f"{self.rule_name_prefix}{ip_address.replace('.', '_')}"
+            response = self.geoip_reader.city(ip)
+            return {
+                "country_code": response.country.iso_code,
+                "country_name": response.country.name,
+                "city": response.city.name,
+                "latitude": response.location.latitude,
+                "longitude": response.location.longitude
+            }
+        except AddressNotFoundError:
+            return {"error": "IP address not found in database"}
+        except Exception as e:
+            logger.error(f"Error retrieving geo data: {e}")
+            return {"error": str(e)}
+    
+    def get_reverse_dns(self, ip: str) -> str:
+        """Perform reverse DNS lookup for an IP address."""
+        try:
+            hostname, _, _ = socket.gethostbyaddr(ip)
+            return hostname
+        except (socket.herror, socket.gaierror):
+            return "No reverse DNS record found"
+        except Exception as e:
+            logger.error(f"Error in reverse DNS lookup: {e}")
+            return "Error in reverse DNS lookup"
+    
+    def send_slack_alert(self, attempt: LoginAttempt, alert_type: str = "single") -> bool:
+        """Send alert to Slack webhook."""
+        if not self.slack_enabled:
+            logger.info("Slack alerts disabled, skipping")
+            return False
+        
+        # Get geolocation data if not already present
+        geo_data = attempt.geo_data or self.get_geo_data(attempt.ip)
+        attempt.geo_data = geo_data
+        
+        # Prepare message
+        if alert_type == "single":
+            title = f"🚨 SSH Brute Force Attempt Detected from {attempt.ip}"
+        else:  # distributed
+            title = f"🚨 Distributed SSH Brute Force Attack Detected"
             
-            # Delete the firewall rule
-            cmd = [
-                'netsh', 'advfirewall', 'firewall', 'delete', 'rule',
-                f'name="{rule_name}"'
+        message = {
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": title}
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*IP Address:*\n{attempt.ip}"},
+                        {"type": "mrkdwn", "text": f"*Username:*\n{attempt.username}"},
+                        {"type": "mrkdwn", "text": f"*Timestamp:*\n{datetime.datetime.fromtimestamp(attempt.timestamp).strftime('%Y-%m-%d %H:%M:%S')}"},
+                    ]
+                }
             ]
-            
-            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-            
-            if "No rules match the specified criteria" in result.stderr:
-                logger.info(f"IP {ip_address} was not found in block list")
+        }
+        
+        # Add geolocation info if available
+        if "error" not in geo_data:
+            geo_block = {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Location:*\n{geo_data.get('city', 'Unknown')}, {geo_data.get('country_name', 'Unknown')}"},
+                    {"type": "mrkdwn", "text": f"*Coordinates:*\n{geo_data.get('latitude', 'Unknown')}, {geo_data.get('longitude', 'Unknown')}"}
+                ]
+            }
+            message["blocks"].append(geo_block)
+        
+        # Add actions
+        message["blocks"].append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Emergency Unblock"},
+                    "value": attempt.ip,
+                    "action_id": "emergency_unblock"
+                }
+            ]
+        })
+        
+        # Send alert
+        try:
+            response = requests.post(
+                self.slack_webhook,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(message),
+                timeout=5
+            )
+            if response.status_code == 200:
+                logger.info(f"Slack alert sent successfully for IP {attempt.ip}")
+                return True
+            else:
+                logger.error(f"Failed to send Slack alert: {response.status_code} - {response.text}")
                 return False
-                
-            block_logger.info(f"UNBLOCKED: {ip_address}")
-            logger.info(f"Successfully unblocked IP {ip_address}")
-            return True
-            
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to unblock IP {ip_address}: {e.stderr}")
-            return False
         except Exception as e:
-            logger.error(f"Failed to unblock IP {ip_address}: {str(e)}")
+            logger.error(f"Error sending Slack alert: {e}")
             return False
     
-    def is_blocked(self, ip_address):
-        """Check if an IP address is currently blocked in Windows Firewall."""
+    def send_email_alert(self, attempt: LoginAttempt, alert_type: str = "single") -> bool:
+        """Send alert via email using SMTP."""
+        if not self.email_enabled:
+            logger.info("Email alerts disabled, skipping")
+            return False
+        
+        # Get geolocation data if not already present
+        geo_data = attempt.geo_data or self.get_geo_data(attempt.ip)
+        attempt.geo_data = geo_data
+        
+        # Get reverse DNS
+        reverse_dns = self.get_reverse_dns(attempt.ip)
+        
+        # Prepare email
+        msg = MIMEMultipart('alternative')
+        
+        if alert_type == "single":
+            msg['Subject'] = f"SSH Brute Force Attempt from {attempt.ip}"
+        else:
+            msg['Subject'] = f"URGENT: Distributed SSH Brute Force Attack Detected"
+            
+        msg['From'] = self.email_from
+        msg['To'] = self.email_to
+        
+        # HTML content with severity-based coloring
+        severity_color = "#FF4500"  # Red-Orange for high severity
+        
+        html = f"""
+        <html>
+          <head></head>
+          <body>
+            <h2 style="color: {severity_color};">SSH Brute Force Detection Alert</h2>
+            <p>A potential SSH brute force attack has been detected:</p>
+            
+            <table border="1" cellpadding="5" cellspacing="0">
+              <tr>
+                <th>IP Address</th>
+                <td>{attempt.ip} ({reverse_dns})</td>
+              </tr>
+              <tr>
+                <th>Username</th>
+                <td>{attempt.username}</td>
+              </tr>
+              <tr>
+                <th>Timestamp</th>
+                <td>{datetime.datetime.fromtimestamp(attempt.timestamp).strftime('%Y-%m-%d %H:%M:%S')}</td>
+              </tr>
+        """
+        
+        # Add geolocation info if available
+        if "error" not in geo_data:
+            html += f"""
+              <tr>
+                <th>Country</th>
+                <td>{geo_data.get('country_name', 'Unknown')} ({geo_data.get('country_code', 'Unknown')})</td>
+              </tr>
+              <tr>
+                <th>City</th>
+                <td>{geo_data.get('city', 'Unknown')}</td>
+              </tr>
+              <tr>
+                <th>Coordinates</th>
+                <td>{geo_data.get('latitude', 'Unknown')}, {geo_data.get('longitude', 'Unknown')}</td>
+              </tr>
+            """
+        
+        html += """
+            </table>
+            
+            <p>This IP has been automatically blocked for 24 hours.</p>
+            <p>To unblock this IP immediately, use the emergency unblock feature in your SSH Defender control panel.</p>
+          </body>
+        </html>
+        """
+        
+        msg.attach(MIMEText(html, 'html'))
+        
+        # Send email
         try:
-            # Create the rule name to check
-            rule_name = f"{self.rule_name_prefix}{ip_address.replace('.', '_')}"
-            
-            # Check if the rule exists
-            cmd = [
-                'netsh', 'advfirewall', 'firewall', 'show', 'rule',
-                f'name="{rule_name}"'
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            return "No rules match the specified criteria" not in result.stdout
-            
+            server = smtplib.SMTP(self.email_smtp_host, self.email_smtp_port)
+            if self.email_use_tls:
+                server.starttls()
+            if self.email_username and self.email_password:
+                server.login(self.email_username, self.email_password)
+            server.sendmail(self.email_from, self.email_to, msg.as_string())
+            server.quit()
+            logger.info(f"Email alert sent successfully for IP {attempt.ip}")
+            return True
         except Exception as e:
-            logger.error(f"Failed to check block status for IP {ip_address}: {str(e)}")
+            logger.error(f"Error sending email alert: {e}")
             return False
     
-    def reload_blocks(self, active_blocks):
-        """Reload active blocks from saved state."""
-        try:
-            # Get all existing rules
-            cmd = ['netsh', 'advfirewall', 'firewall', 'show', 'rule', 'name=all']
-            result = subprocess.run(cmd, capture_output=True, text=True)
+    def send_alerts(self, attempt: LoginAttempt, alert_type: str = "single") -> None:
+        """Send all configured alerts (Slack, email) in parallel."""
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            slack_future = executor.submit(self.send_slack_alert, attempt, alert_type)
+            email_future = executor.submit(self.send_email_alert, attempt, alert_type)
             
-            # Delete all existing SSH Defender rules
-            for line in result.stdout.splitlines():
-                if line.startswith("Rule Name:") and self.rule_name_prefix in line:
-                    rule_name = line.split(":", 1)[1].strip()
-                    delete_cmd = ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name="{rule_name}"']
-                    subprocess.run(delete_cmd, capture_output=True)
-            
-            # Reload active blocks
-            count = 0
-            for ip, expiry_time in active_blocks.items():
-                # Only reload if the block hasn't expired
-                if datetime.fromisoformat(expiry_time) > datetime.now():
-                    self.block_ip(ip)
-                    count += 1
-            
-            logger.info(f"Reloaded {count} active IP blocks")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to reload IP blocks: {str(e)}")
-            return False
+            # Get results (and handle any exceptions)
+            try:
+                slack_result = slack_future.result()
+                email_result = email_future.result()
+                logger.info(f"Alert results - Slack: {slack_result}, Email: {email_result}")
+            except Exception as e:
+                logger.error(f"Error during alert sending: {e}")
 
 
-class MacOSIPBlocker(IPBlocker):
-    """macOS implementation of IP blocking using pfctl."""
+class BlockHandler(ABC):
+    """Abstract base class for platform-specific blocking implementations."""
+    
+    @abstractmethod
+    def block_ip(self, ip: str, duration: int = 86400) -> bool:
+        """Block an IP address for the specified duration in seconds."""
+        pass
+    
+    @abstractmethod
+    def unblock_ip(self, ip: str) -> bool:
+        """Unblock a previously blocked IP address."""
+        pass
+    
+    @abstractmethod
+    def is_blocked(self, ip: str) -> bool:
+        """Check if an IP is currently blocked."""
+        pass
+    
+    @abstractmethod
+    def reload_blocks(self) -> None:
+        """Reload block list after system restart."""
+        pass
+
+
+class LinuxBlockHandler(BlockHandler):
+    """Linux-specific implementation using iptables."""
     
     def __init__(self):
-        """Initialize the macOS IP blocker."""
-        self.pf_file = "/etc/pf.anchors/ssh_defender"
-        self.anchor_name = "ssh_defender"
+        """Initialize the Linux block handler."""
+        self.chain_name = "SSH_DEFENDER"
+        self.ensure_chain_exists()
         
-        # Ensure anchor is loaded
-        self._ensure_anchor_exists()
-        logger.info("macOS IPBlocker initialized")
-    
-    def _ensure_anchor_exists(self):
-        """Ensure the pf anchor exists and is loaded."""
+    def ensure_chain_exists(self) -> None:
+        """Ensure the iptables chain exists."""
         try:
-            # Create anchor file if it doesn't exist
-            if not os.path.exists(self.pf_file):
-                with open(self.pf_file, 'w') as f:
-                    f.write("# SSH Defender Blocks\n")
+            # Check if the chain already exists
+            table = iptc.Table(iptc.Table.FILTER)
+            if self.chain_name not in table.chains:
+                # Create the chain
+                iptc.Chain(table, self.chain_name)
                 
-                # Check if anchor is in main config
-                with open('/etc/pf.conf', 'r') as f:
-                    config = f.read()
+                # Add a jump rule from INPUT chain to our chain
+                chain = iptc.Chain(table, "INPUT")
+                rule = iptc.Rule()
+                rule.protocol = "tcp"
+                match = iptc.Match(rule, "tcp")
+                match.dport = "22"  # SSH port
+                rule.add_match(match)
+                target = iptc.Target(rule, self.chain_name)
+                rule.target = target
+                chain.insert_rule(rule)
                 
-                if f'anchor "{self.anchor_name}"' not in config:
-                    logger.error(f"Anchor {self.anchor_name} is not loaded in /etc/pf.conf")
-                    logger.error("Please add 'anchor \"ssh_defender\"' to /etc/pf.conf and run 'sudo pfctl -f /etc/pf.conf'")
-            
-            # Load the anchor
-            subprocess.run(['pfctl', '-a', self.anchor_name, '-f', self.pf_file], check=True, capture_output=True)
-            
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to initialize pf anchor: {e.stderr}")
+                logger.info(f"Created iptables chain {self.chain_name}")
+            else:
+                logger.info(f"Iptables chain {self.chain_name} already exists")
         except Exception as e:
-            logger.error(f"Failed to initialize pf anchor: {str(e)}")
+            logger.error(f"Error ensuring iptables chain exists: {e}")
     
-    def block_ip(self, ip_address, duration_hours=24):
-        """Block an IP address using pf."""
+    def block_ip(self, ip: str, duration: int = 86400) -> bool:
+        """Block an IP using iptables."""
         try:
-            # Check if already blocked
-            if self.is_blocked(ip_address):
-                logger.info(f"IP {ip_address} is already blocked")
-                return True
+            # Create the rule
+            table = iptc.Table(iptc.Table.FILTER)
+            chain = iptc.Chain(table, self.chain_name)
+            rule = iptc.Rule()
+            rule.src = ip
+            target = iptc.Target(rule, "DROP")
+            rule.target = target
+            chain.append_rule(rule)
             
-            # Add block rule to anchor file
-            with open(self.pf_file, 'a') as f:
-                f.write(f"block return in quick proto tcp from {ip_address} to any port 22\n")
+            # Log block with expiration
+            expiration_time = time.time() + duration
+            with sqlite3.connect("/var/lib/ssh-defender/blocks.db") as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "CREATE TABLE IF NOT EXISTS blocks (ip TEXT PRIMARY KEY, expiration REAL)"
+                )
+                cursor.execute(
+                    "INSERT OR REPLACE INTO blocks VALUES (?, ?)",
+                    (ip, expiration_time)
+                )
+                conn.commit()
             
-            # Reload the anchor
-            subprocess.run(['pfctl', '-a', self.anchor_name, '-f', self.pf_file], check=True, capture_output=True)
-            
-            expiry_time = datetime.now() + timedelta(hours=duration_hours)
-            block_logger.info(f"BLOCKED: {ip_address} until {expiry_time.isoformat()}")
-            logger.info(f"Successfully blocked IP {ip_address} for {duration_hours} hours")
+            logger.info(f"Blocked IP {ip} for {duration} seconds")
             return True
-            
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to block IP {ip_address}: {e.stderr}")
-            return False
         except Exception as e:
-            logger.error(f"Failed to block IP {ip_address}: {str(e)}")
+            logger.error(f"Failed to block IP {ip}: {e}")
             return False
     
-    def unblock_ip(self, ip_address):
-        """Remove a block for an IP address from pf."""
+    def unblock_ip(self, ip: str) -> bool:
+        """Unblock an IP by removing the iptables rule."""
         try:
-            # Read existing rules
-            with open(self.pf_file, 'r') as f:
+            table = iptc.Table(iptc.Table.FILTER)
+            chain = iptc.Chain(table, self.chain_name)
+            
+            # Find and delete the rule
+            for rule in chain.rules:
+                if rule.src == ip:
+                    chain.delete_rule(rule)
+            
+            # Remove from database
+            with sqlite3.connect("/var/lib/ssh-defender/blocks.db") as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM blocks WHERE ip = ?", (ip,))
+                conn.commit()
+            
+            logger.info(f"Unblocked IP {ip}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to unblock IP {ip}: {e}")
+            return False
+    
+    def is_blocked(self, ip: str) -> bool:
+        """Check if an IP is currently blocked."""
+        try:
+            table = iptc.Table(iptc.Table.FILTER)
+            chain = iptc.Chain(table, self.chain_name)
+            
+            for rule in chain.rules:
+                if rule.src == ip:
+                    return True
+            return False
+        except Exception as e:
+            logger.error(f"Error checking if IP {ip} is blocked: {e}")
+            return False
+    
+    def reload_blocks(self) -> None:
+        """Reload blocks from database after system restart."""
+        try:
+            current_time = time.time()
+            with sqlite3.connect("/var/lib/ssh-defender/blocks.db") as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT ip, expiration FROM blocks")
+                for ip, expiration in cursor.fetchall():
+                    # If the block hasn't expired, reinstate it
+                    if expiration > current_time:
+                        remaining_time = int(expiration - current_time)
+                        # Skip database update as we'll just use the existing record
+                        self._block_ip_without_db(ip)
+                        logger.info(f"Reloaded block for IP {ip} for {remaining_time} more seconds")
+                    else:
+                        # Block has expired, remove it from the database
+                        cursor.execute("DELETE FROM blocks WHERE ip = ?", (ip,))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error reloading blocks: {e}")
+    
+    def _block_ip_without_db(self, ip: str) -> bool:
+        """Block an IP without updating the database (for reload use)."""
+        try:
+            table = iptc.Table(iptc.Table.FILTER)
+            chain = iptc.Chain(table, self.chain_name)
+            rule = iptc.Rule()
+            rule.src = ip
+            target = iptc.Target(rule, "DROP")
+            rule.target = target
+            chain.append_rule(rule)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reinstate block for IP {ip}: {e}")
+            return False
+
+
+class WindowsBlockHandler(BlockHandler):
+    """Windows-specific implementation using Windows Firewall."""
+    
+    def __init__(self):
+        """Initialize the Windows block handler."""
+        self.rule_name_prefix = "SSH_DEFENDER_BLOCK_"
+        self.db_path = r"C:\ssh-defender\blocks.db"
+        self._ensure_db_exists()
+    
+    def _ensure_db_exists(self) -> None:
+        """Ensure the database file and directory exist."""
+        db_dir = os.path.dirname(self.db_path)
+        os.makedirs(db_dir, exist_ok=True)
+        
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS blocks (ip TEXT PRIMARY KEY, expiration REAL)"
+            )
+            conn.commit()
+    
+    def block_ip(self, ip: str, duration: int = 86400) -> bool:
+        """Block an IP using Windows Firewall."""
+        try:
+            # Create firewall rule using PowerShell
+            rule_name = f"{self.rule_name_prefix}{ip.replace('.', '_')}"
+            ps_command = (
+                f"New-NetFirewallRule -Name '{rule_name}' -DisplayName '{rule_name}' "
+                f"-Direction Inbound -Protocol TCP -LocalPort 22 -Action Block "
+                f"-RemoteAddress {ip}"
+            )
+            
+            subprocess.run(["powershell", "-Command", ps_command], check=True)
+            
+            # Store in database for cooldown tracking
+            expiration_time = time.time() + duration
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR REPLACE INTO blocks VALUES (?, ?)",
+                    (ip, expiration_time)
+                )
+                conn.commit()
+            
+            logger.info(f"Blocked IP {ip} for {duration} seconds")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to block IP {ip}: {e}")
+            return False
+    
+    def unblock_ip(self, ip: str) -> bool:
+        """Unblock an IP by removing the Windows Firewall rule."""
+        try:
+            rule_name = f"{self.rule_name_prefix}{ip.replace('.', '_')}"
+            ps_command = f"Remove-NetFirewallRule -Name '{rule_name}' -ErrorAction SilentlyContinue"
+            
+            subprocess.run(["powershell", "-Command", ps_command], check=True)
+            
+            # Remove from database
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM blocks WHERE ip = ?", (ip,))
+                conn.commit()
+            
+            logger.info(f"Unblocked IP {ip}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to unblock IP {ip}: {e}")
+            return False
+    
+    def is_blocked(self, ip: str) -> bool:
+        """Check if an IP is currently blocked in Windows Firewall."""
+        try:
+            rule_name = f"{self.rule_name_prefix}{ip.replace('.', '_')}"
+            ps_command = f"Get-NetFirewallRule -Name '{rule_name}' -ErrorAction SilentlyContinue"
+            
+            result = subprocess.run(
+                ["powershell", "-Command", ps_command],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            return result.returncode == 0 and result.stdout.strip() != ""
+        except Exception as e:
+            logger.error(f"Error checking if IP {ip} is blocked: {e}")
+            return False
+    
+    def reload_blocks(self) -> None:
+        """Reload blocks from database after system restart."""
+        try:
+            current_time = time.time()
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT ip, expiration FROM blocks")
+                for ip, expiration in cursor.fetchall():
+                    # Check if rule exists already
+                    if not self.is_blocked(ip):
+                        # If the block hasn't expired, reinstate it
+                        if expiration > current_time:
+                            remaining_time = int(expiration - current_time)
+                            # Create the rule but don't update DB
+                            self._block_ip_without_db(ip)
+                            logger.info(f"Reloaded block for IP {ip} for {remaining_time} more seconds")
+                        else:
+                            # Block has expired, remove it from the database
+                            cursor.execute("DELETE FROM blocks WHERE ip = ?", (ip,))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error reloading blocks: {e}")
+    
+    def _block_ip_without_db(self, ip: str) -> bool:
+        """Block an IP without updating the database (for reload use)."""
+        try:
+            rule_name = f"{self.rule_name_prefix}{ip.replace('.', '_')}"
+            ps_command = (
+                f"New-NetFirewallRule -Name '{rule_name}' -DisplayName '{rule_name}' "
+                f"-Direction Inbound -Protocol TCP -LocalPort 22 -Action Block "
+                f"-RemoteAddress {ip}"
+            )
+            
+            subprocess.run(["powershell", "-Command", ps_command], check=True)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reinstate block for IP {ip}: {e}")
+            return False
+
+
+class MacOSBlockHandler(BlockHandler):
+    """macOS-specific implementation using pf firewall."""
+    
+    def __init__(self):
+        """Initialize the macOS block handler."""
+        self.block_file = "/etc/pf.anchors/ssh-defender"
+        self.db_path = "/Library/Application Support/ssh-defender/blocks.db"
+        self._ensure_files_exist()
+    
+    def _ensure_files_exist(self) -> None:
+        """Ensure required files and directories exist."""
+        # Create database directory if it doesn't exist
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        
+        # Create block file if it doesn't exist
+        if not os.path.exists(self.block_file):
+            with open(self.block_file, 'w') as f:
+                f.write("# SSH Defender Block List\n")
+        
+        # Ensure anchor is included in pf.conf
+        try:
+            with open("/etc/pf.conf", 'r') as f:
+                pf_conf = f.read()
+            
+            if f"anchor \"ssh-defender\"" not in pf_conf:
+                with open("/etc/pf.conf", 'a') as f:
+                    f.write("\n# SSH Defender\nanchor \"ssh-defender\"\nload anchor \"ssh-defender\" from \"/etc/pf.anchors/ssh-defender\"\n")
+                
+                # Reload pf configuration
+                subprocess.run(["pfctl", "-f", "/etc/pf.conf"], check=True)
+        except Exception as e:
+            logger.error(f"Error setting up pf anchor: {e}")
+        
+        # Initialize database
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "CREATE TABLE IF NOT EXISTS blocks (ip TEXT PRIMARY KEY, expiration REAL)"
+            )
+            conn.commit()
+    
+    def block_ip(self, ip: str, duration: int = 86400) -> bool:
+        """Block an IP using macOS pf firewall."""
+        try:
+            # Add to block file
+            with open(self.block_file, 'r') as f:
                 lines = f.readlines()
             
-            # Filter out the rule for this IP
-            new_lines = [line for line in lines if ip_address not in line]
+            # Check if IP is already in the file
+            rule = f"block in from {ip} to any port 22\n"
+            if rule not in lines:
+                lines.append(rule)
+                
+                with open(self.block_file, 'w') as f:
+                    f.writelines(lines)
+                
+                # Reload pf rules
+                subprocess.run(["pfctl", "-f", self.block_file], check=True)
             
-            # If no changes were made, IP wasn't blocked
-            if len(lines) == len(new_lines):
-                logger.info(f"IP {ip_address} was not found in block list")
-                return False
+            # Store in database for cooldown tracking
+            expiration_time = time.time() + duration
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT OR REPLACE INTO blocks VALUES (?, ?)",
+                    (ip, expiration_time)
+                )
+                conn.commit()
             
-            # Write back the file without the rule
-            with open(self.pf_file, 'w') as f:
-                f.writelines(new_lines)
-            
-            # Reload the anchor
-            subprocess.run(['pfctl', '-a', self.anchor_name, '-f', self.pf_file], check=True, capture_output=True)
-            
-            block_logger.info(f"UNBLOCKED: {ip_address}")
-            logger.info(f"Successfully unblocked IP {ip_address}")
+            logger.info(f"Blocked IP {ip} for {duration} seconds")
             return True
-            
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to unblock IP {ip_address}: {e.stderr}")
-            return False
         except Exception as e:
-            logger.error(f"Failed to unblock IP {ip_address}: {str(e)}")
-            return False
-    
-    def is_blocked(self, ip_address):
-        """Check if an IP address is currently blocked in pf."""
-        try:
-            # Read anchor file and check if IP is in it
-            with open(self.pf_file, 'r') as f:
-                content = f.read()
-                return ip_address in content
-            
-        except Exception as e:
-            logger.error(f"Failed to check block status for IP {ip_address}: {str(e)}")
+            logger.error(f"Failed to block IP {ip}: {e}")
             return False
     
-    def reload_blocks(self, active_blocks):
-        """Reload active blocks from saved state."""
+    def unblock_ip(self, ip: str) -> bool:
+        """Unblock an IP by removing it from the pf rules."""
         try:
-            # Clear the anchor file
-            with open(self.pf_file, 'w') as f:
-                f.write("# SSH Defender Blocks\n")
+            # Remove from block file
+            with open(self.block_file, 'r') as f:
+                lines = f.readlines()
             
-            # Add active blocks that haven't expired
-            count = 0
-            for ip, expiry_time in active_blocks.items():
-                if datetime.fromisoformat(expiry_time) > datetime.now():
-                    with open(self.pf_file, 'a') as f:
-                        f.write(f"block return in quick proto tcp from {ip} to any port 22\n")
-                    count += 1
-            
-            # Reload the anchor
-            subprocess.run(['pfctl', '-a', self.anchor_name, '-f', self.pf_file], check=True, capture_output=True)
-            
-            logger.info(f"Reloaded {count} active IP blocks")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to reload IP blocks: {str(e)}")
-            return False
-
-
-class SSHDefenderBlocker:
-    """Main SSH Defender IP blocking management class."""
-    
-    def __init__(self, config_path):
-        """
-        Initialize the SSH Defender IP blocker.
-        
-        Args:
-            config_path (str): Path to the configuration file (YAML or JSON)
-        """
-        self.config_path = config_path
-        self.active_blocks = {}  # IP -> expiry time
-        self.whitelist = set()  # Set of whitelisted IPs/CIDRs
-        self.blocker = self._get_platform_blocker()
-        
-        # Load configuration
-        self._load_config()
-        
-        # Load existing blocks
-        self._load_blocks()
-        
-        # Start expiry checker thread
-        self.running = True
-        self.expiry_thread = threading.Thread(target=self._check_expired_blocks)
-        self.expiry_thread.daemon = True
-        self.expiry_thread.start()
-    
-    def _get_platform_blocker(self):
-        """Get the appropriate IP blocker for the current platform."""
-        platform = sys.platform
-        
-        if platform.startswith('linux'):
-            return LinuxIPBlocker()
-        elif platform.startswith('win'):
-            return WindowsIPBlocker()
-        elif platform.startswith('darwin'):
-            return MacOSIPBlocker()
-        else:
-            logger.error(f"Unsupported platform: {platform}")
-            sys.exit(1)
-    
-    def _load_config(self):
-        """Load configuration from YAML or JSON file."""
-        try:
-            if not os.path.exists(self.config_path):
-                logger.warning(f"Config file {self.config_path} not found. Using empty whitelist.")
-                return
-            
-            with open(self.config_path, 'r') as f:
-                if self.config_path.endswith('.yaml') or self.config_path.endswith('.yml'):
-                    config = yaml.safe_load(f)
-                else:
-                    config = json.load(f)
-            
-            # Load whitelist
-            if 'whitelist' in config:
-                for entry in config['whitelist']:
-                    self.whitelist.add(entry)
+            rule = f"block in from {ip} to any port 22\n"
+            if rule in lines:
+                lines.remove(rule)
                 
-                logger.info(f"Loaded {len(self.whitelist)} whitelist entries")
-            
-        except Exception as e:
-            logger.error(f"Failed to load config: {str(e)}")
-    
-    def _load_blocks(self):
-        """Load active blocks from storage."""
-        try:
-            if os.path.exists(BLOCK_STORAGE_PATH):
-                with open(BLOCK_STORAGE_PATH, 'r') as f:
-                    self.active_blocks = json.load(f)
+                with open(self.block_file, 'w') as f:
+                    f.writelines(lines)
                 
-                # Remove expired blocks
-                now = datetime.now().isoformat()
-                self.active_blocks = {
-                    ip: expiry for ip, expiry in self.active_blocks.items()
-                    if expiry > now
-                }
-                
-                # Reload blocks in the system
-                self.blocker.reload_blocks(self.active_blocks)
-                
-                logger.info(f"Loaded {len(self.active_blocks)} active blocks from storage")
-            else:
-                logger.info("No stored blocks found")
-        
-        except Exception as e:
-            logger.error(f"Failed to load blocks: {str(e)}")
-    
-    def _save_blocks(self):
-        """Save active blocks to storage."""
-        try:
-            with open(BLOCK_STORAGE_PATH, 'w') as f:
-                json.dump(self.active_blocks, f)
-            
-            logger.debug("Saved active blocks to storage")
-        
-        except Exception as e:
-            logger.error(f"Failed to save blocks: {str(e)}")
-    
-    def _check_expired_blocks(self):
-        """Periodically check for and remove expired blocks."""
-        while self.running:
-            try:
-                now = datetime.now().isoformat()
-                expired_ips = []
-                
-                # Find expired blocks
-                for ip, expiry in self.active_blocks.items():
-                    if expiry <= now:
-                        expired_ips.append(ip)
-                
-                # Remove expired blocks
-                for ip in expired_ips:
-                    self.unblock_ip(ip)
-                    logger.info(f"Automatically unblocked expired IP: {ip}")
-                
-                # Save changes
-                if expired_ips:
-                    self._save_blocks()
-                
-                # Sleep for a minute
-                time.sleep(60)
-                
-            except Exception as e:
-                logger.error(f"Error in expiry checker: {str(e)}")
-                time.sleep(60)
-    
-    def is_whitelisted(self, ip_address):
-        """
-        Check if an IP address is whitelisted.
-        
-        Args:
-            ip_address (str): The IP address to check
-            
-        Returns:
-            bool: True if IP is whitelisted, False otherwise
-        """
-        # Check exact IP match
-        if ip_address in self.whitelist:
-            return True
-        
-        # Check CIDR ranges
-        try:
-            ip_obj = ipaddress.ip_address(ip_address)
-            for entry in self.whitelist:
-                if '/' in entry:  # It's a CIDR range
-                    network = ipaddress.ip_network(entry, strict=False)
-                    if ip_obj in network:
-                        return True
-        except ValueError:
-            logger.error(f"Invalid IP address or CIDR: {ip_address}")
-        
-        return False
-    
-    def block_ip(self, ip_address, duration_hours=24):
-        """
-        Block an IP address if it's not whitelisted.
-        
-        Args:
-            ip_address (str): The IP address to block
-            duration_hours (int): Number of hours to block the IP for
-            
-        Returns:
-            bool: True if block was successful or IP is whitelisted, False otherwise
-        """
-        # Check whitelist
-        if self.is_whitelisted(ip_address):
-            logger.info(f"Not blocking whitelisted IP: {ip_address}")
-            return True
-        
-        # Block the IP
-        success = self.blocker.block_ip(ip_address, duration_hours)
-        
-        if success:
-            # Update active blocks
-            expiry_time = (datetime.now() + timedelta(hours=duration_hours)).isoformat()
-            self.active_blocks[ip_address] = expiry_time
-            self._save_blocks()
-        
-        return success
-    
-    def unblock_ip(self, ip_address):
-        """
-        Unblock an IP address.
-        
-        Args:
-            ip_address (str): The IP address to unblock
-            
-        Returns:
-            bool: True if unblock was successful, False otherwise
-        """
-        success = self.blocker.unblock_ip(ip_address)
-        
-        if success and ip_address in self.active_blocks:
-            del self.active_blocks[ip_address]
-            self._save_blocks()
-        
-        return success
-    
-    def is_blocked(self, ip_address):
-        """
-        Check if an IP address is currently blocked.
-        
-        Args:
-            ip_address (str): The IP address to check
-            
-        Returns:
-            bool: True if IP is blocked, False otherwise
-        """
-        return self.blocker.is_blocked(ip_address)
-    
-    def shutdown(self):
-        """Clean up resources and shut down the blocker."""
-        self.running = False
-        if self.expiry_thread.is_alive():
-            self.expiry_thread.join(timeout=1)
-        logger.info("SSH Defender Blocker shut down")
-
-
-# Example usage
-if __name__ == "__main__":
-    # Example config file contents (save as config.yaml)
-    example_config = """
-    whitelist:
-      - 192.168.1.0/24
-      - 10.0.0.1
-      - 127.0.0.1
-    """
-    
-    # Write example config to disk
-    with open('example_config.yaml', 'w') as f:
-        f.write(example_config)
-    
-    print("Example configuration created in example_config.yaml")
-    print("Whitelist entries:")
-    print("  - 192.168.1.0/24 (entire subnet)")
-    print("  - 10.0.0.1 (specific IP)")
-    print("  - 127.0.0.1 (localhost)")
-    
-    print("\nUsage example (not actually executed):")
-    print("defender = SSHDefenderBlocker('example_config.yaml')")
-    print("defender.block_ip('45.227.255.206', duration_hours=24)")
-    print("defender.unblock_ip('45.227.255.206')")
-    print("defender.is_whitelisted('192.168.1.10')  # Would return True")
-    print("defender.is_whitelisted('45.227.255.206')  # Would return False")
-    print("defender.shutdown()")
+                # Reload pf
